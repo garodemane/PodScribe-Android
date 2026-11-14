@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.PodScribe" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FFF0EF</item>
+        <item name="android:statusBarColor">#FFF0EF</item>
+        <item name="android:navigationBarColor">#FFF0EF</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

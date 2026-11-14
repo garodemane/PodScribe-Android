@@ -1,0 +1,20 @@
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+.kotlin/
+
+# IDE and local output
+.idea/
+*.iml
+*.png
+*.jpg
+*.jpeg
+*.webp
+release/
+public-release-staging/
+
+# Local signing material
+*.jks
+*.keystore
+keystore.properties
