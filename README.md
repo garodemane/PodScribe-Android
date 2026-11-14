@@ -1,6 +1,6 @@
 # PodScribe
 
-**Persian:** پادساین یک اپ اندرویدی برای دنبال‌کردن پادکست‌ها، گوش‌دادن به قسمت‌ها و ساخت یا ترجمه‌ی رونوشت صوتی است. دارای پخش‌کننده‌ی تمام‌صفحه، ذخیره‌ی قسمت‌ها، رابط فارسی و دو تم روشن و تیره است. برای ترنسکریپشن ابری به Gemini API key نیاز دارید؛ مدل روی‌دستگاه نیز در تنظیمات قابل انتخاب است.
+**Persian:** پادسکرایب یک اپ اندرویدی برای دنبال‌کردن پادکست‌ها، گوش‌دادن به قسمت‌ها و ساخت یا ترجمه‌ی رونوشت صوتی است. دارای پخش‌کننده‌ی تمام‌صفحه، ذخیره‌ی قسمت‌ها، رابط فارسی و دو تم روشن و تیره است. برای ترنسکریپشن ابری به Gemini API key نیاز دارید؛ مدل روی‌دستگاه نیز در تنظیمات قابل انتخاب است.
 
 **English:** PodScribe is an Android podcast app for following shows, listening to episodes, and creating or translating transcripts. It includes a full-screen player, episode downloads, Persian/RTL support, and light and dark themes. Cloud transcription requires a Gemini API key; an on-device engine is also available in Settings.
 
