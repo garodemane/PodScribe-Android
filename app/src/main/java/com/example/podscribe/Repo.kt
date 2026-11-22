@@ -135,6 +135,13 @@ object Repo {
         podcasts.value = podcasts.value.map { current -> results.find { it.first.id == current.id }?.first ?: current }
         episodes.value = (episodes.value.filterNot { it.podcastId in refreshedIds } + freshEpisodes).sortedByDescending { it.pubDate }
         save()
+        prefs.edit().putLong("lastFeedRefresh", System.currentTimeMillis()).apply()
+    }
+
+    suspend fun refreshIfStale(force: Boolean = false) {
+        if (podcasts.value.isEmpty()) return
+        val last = prefs.getLong("lastFeedRefresh", 0L)
+        if (force || System.currentTimeMillis() - last >= TimeUnit.MINUTES.toMillis(30)) refreshAll()
     }
 
     suspend fun importOpml(input: InputStream) = withContext(Dispatchers.IO) {
@@ -413,5 +420,6 @@ object Repo {
     }
     var tsSize: Int get() = prefs.getInt("tsize", 20); set(v) { prefs.edit().putInt("tsize", v).apply() }
     var tsMode: Int get() = prefs.getInt("tmode", 2); set(v) { prefs.edit().putInt("tmode", v).apply() }
+    var transcriptAutoFollow: Boolean get() = prefs.getBoolean("transcriptAutoFollow", true); set(v) { prefs.edit().putBoolean("transcriptAutoFollow", v).apply() }
     fun keys() = keysText.lines().map { it.trim() }.filter { it.isNotEmpty() }
 }

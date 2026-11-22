@@ -265,11 +265,8 @@ object Transcriber {
             val versionKey = "gemini-transcript-config-${md5(id)}"
             val configStamp = "v2|$model|$lang|300s"
             if (Repo.prefs.getString(versionKey, null) != configStamp) {
-                Repo.saveSegs(id, emptyList())
-                segs.value = segs.value + (id to emptyList())
-                Repo.setTranscriptionProgress(id, 0)
-                // Previous builds used 10-minute chunks and could silently keep
-                // incomplete subtitles. Rebuild once with the safer 5-minute path.
+                // Keep existing transcript segments when transcription settings change.
+                // New work resumes from the saved progress and only updates its later chunks.
                 Repo.prefs.edit().putString(versionKey, configStamp).apply()
             }
             val all = ArrayList<Seg>(segs.value[id] ?: emptyList())

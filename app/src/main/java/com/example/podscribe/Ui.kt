@@ -752,9 +752,13 @@ private fun timedHighlight(words: List<WordStamp>, active: Int, accent: Color = 
 
 @Composable
 fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
-    val transcriptId = if (Repo.transcriptionEngine == "local") LocalModels.transcriptId(ep.id) else ep.id
     val allSegs by Transcriber.segs.collectAsState()
     val statuses by Transcriber.status.collectAsState()
+    val preferredId = if (Repo.transcriptionEngine == "local") LocalModels.transcriptId(ep.id) else ep.id
+    val transcriptIds = remember(ep.id) { listOf(ep.id) + LocalModels.catalog.map { LocalModels.transcriptId(it.id, ep.id) } }
+    LaunchedEffect(ep.id) { transcriptIds.forEach(Transcriber::load) }
+    val transcriptId = if (allSegs[preferredId].orEmpty().isNotEmpty()) preferredId
+        else transcriptIds.firstOrNull { allSegs[it].orEmpty().isNotEmpty() } ?: preferredId
     val segs = allSegs[transcriptId] ?: emptyList()
     val status = statuses[ep.id]
     val busy = status != null && !status.startsWith("Failed")
@@ -779,13 +783,14 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
         }
     }
     var mode by remember(transcriptId) { mutableIntStateOf(if (localTranscript) 0 else Repo.tsMode) }
-    val state = rememberLazyListState()
+    val scrollState = rememberScrollState()
     var lastFollowedIndex by remember(transcriptId) { mutableIntStateOf(-1) }
     val followedIndex = if (vm.playing) displaySegs.indexOfLast { it.startMs <= vm.pos }.takeIf { it >= 0 && vm.pos <= displaySegs[it].endMs } ?: -1 else -1
-    LaunchedEffect(transcriptId) { Transcriber.load(transcriptId) }
-    LaunchedEffect(followedIndex) {
-        if (followedIndex >= 0 && followedIndex != lastFollowedIndex) {
-            state.animateScrollToItem(followedIndex, scrollOffset = -48)
+    var autoFollow by remember { mutableStateOf(Repo.transcriptAutoFollow) }
+    LaunchedEffect(followedIndex, autoFollow) {
+        if (autoFollow && followedIndex >= 0 && followedIndex != lastFollowedIndex) {
+            val fraction = followedIndex.toFloat() / displaySegs.size.coerceAtLeast(1)
+            scrollState.animateScrollTo((fraction * scrollState.maxValue).toInt().coerceIn(0, scrollState.maxValue))
             lastFollowedIndex = followedIndex
         }
     }
@@ -809,8 +814,11 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
         out
     }
     LaunchedEffect(query, mode) { cur = 0 }
-    LaunchedEffect(cur, matches) {
-        if (matches.isNotEmpty()) state.animateScrollToItem(matches[cur.coerceIn(0, matches.lastIndex)].first)
+    LaunchedEffect(cur, matches, displaySegs) {
+        if (matches.isNotEmpty()) {
+            val fraction = matches[cur.coerceIn(0, matches.lastIndex)].first.toFloat() / displaySegs.size.coerceAtLeast(1)
+            scrollState.animateScrollTo((fraction * scrollState.maxValue).toInt().coerceIn(0, scrollState.maxValue))
+        }
     }
     fun next() { if (matches.isNotEmpty()) cur = (cur + 1) % matches.size }
     fun prev() { if (matches.isNotEmpty()) cur = (cur - 1 + matches.size) % matches.size }
@@ -825,6 +833,10 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
                 Icon(Icons.Filled.Search, "Search transcript", tint = if (searchOpen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
             }
             if (displaySegs.isNotEmpty()) IconButton({ confirmClear = true }) { Icon(Icons.Filled.DeleteOutline, "Delete transcript", tint = MaterialTheme.colorScheme.error) }
+            IconButton({ autoFollow = !autoFollow; Repo.transcriptAutoFollow = autoFollow }) {
+                Icon(Icons.Filled.Sync, if (autoFollow) "Turn off transcript auto-follow" else "Turn on transcript auto-follow",
+                    tint = if (autoFollow) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             if (busy) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
             else IconButton({ vm.transcribe(ep) }) { Icon(Icons.Filled.Subtitles, "Transcribe", tint = MaterialTheme.colorScheme.primary) }
         }
@@ -846,8 +858,8 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
                 }
             } else CompositionLocalProvider(LocalTextToolbar provides toolbar) {
                 SelectionContainer {
-                    LazyColumn(state = state, contentPadding = PaddingValues(vertical = 16.dp)) {
-                        itemsIndexed(displaySegs, key = { _, s -> s.startMs }) { i, s ->
+                    Column(Modifier.fillMaxSize().verticalScroll(scrollState).padding(vertical = 16.dp)) {
+                        displaySegs.forEachIndexed { i, s ->
                             val cm = matches.getOrNull(cur)
                             val curK = if (cm != null && cm.first == i) cm.second else -1
                             val showOriginal = showOrig(s, mode) || s.tr.isBlank()
@@ -869,16 +881,16 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
     }
     if (confirmClear) AlertDialog(onDismissRequest = { confirmClear = false }, title = { Text("Delete transcript?") },
         text = { Text("The transcript will be removed. You can transcribe this episode again later.") },
-        confirmButton = { TextButton({ confirmClear = false; Repo.clearTranscript(ep.id); Transcriber.load(transcriptId) }) { Text("Delete") } },
+        confirmButton = { TextButton({ confirmClear = false; Repo.clearTranscript(ep.id); transcriptIds.forEach { Transcriber.load(it) } }) { Text("Delete") } },
         dismissButton = { TextButton({ confirmClear = false }) { Text("Cancel") } })
 }
 
 @Composable
 fun SkipBtn(sec: Int, forward: Boolean, onClick: () -> Unit) {
     val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
-    IconButton(onClick, Modifier.size(52.dp), enabled = true) {
+    IconButton(onClick, Modifier.size(44.dp), enabled = true) {
         Box(contentAlignment = Alignment.Center) {
-            Icon(Icons.Filled.Replay, if (forward) "Skip forward $sec seconds" else "Skip back $sec seconds", Modifier.size(40.dp).graphicsLayer { if (forward xor isRtl) scaleX = -1f })
+            Icon(Icons.Filled.Replay, if (forward) "Skip forward $sec seconds" else "Skip back $sec seconds", Modifier.size(36.dp).graphicsLayer { if (forward xor isRtl) scaleX = -1f })
             Text("$sec", fontSize = 11.sp)
         }
     }
@@ -923,19 +935,20 @@ fun NowPlaying(vm: AppVM, onClose: () -> Unit) {
                         Text("−${fmt((vm.dur - vm.pos).coerceAtLeast(0))}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                        IconButton({ vm.prev() }) { Icon(Icons.Filled.SkipPrevious, "Previous", Modifier.size(30.dp).graphicsLayer { if (isRtl) scaleX = -1f }) }
+                        IconButton({ vm.prev() }, Modifier.size(40.dp)) { Icon(Icons.Filled.SkipPrevious, "Previous", Modifier.size(28.dp).graphicsLayer { if (isRtl) scaleX = -1f }) }
                         SkipBtn(vm.skipBack, false) { vm.seekBy(-vm.skipBack * 1000L) }
-                        FilledIconButton({ vm.toggle() }, Modifier.size(64.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary)) {
+                        FilledIconButton({ vm.toggle() }, Modifier.size(56.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary)) {
                             Icon(if (vm.playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                                 if (vm.playing) "Pause playback" else "Play playback", Modifier.size(36.dp))
                         }
                         SkipBtn(vm.skipFwd, true) { vm.seekBy(vm.skipFwd * 1000L) }
-                        IconButton({ vm.next() }) { Icon(Icons.Filled.SkipNext, "Next", Modifier.size(30.dp).graphicsLayer { if (isRtl) scaleX = -1f }) }
-                    }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                        AssistChip({ opts = true }, { Text("%.1fx speed".format(vm.speed)) }, leadingIcon = { Icon(Icons.Filled.Speed, null, Modifier.size(18.dp)) })
-                        IconButton({ vm.restart() }) { Icon(Icons.Filled.RestartAlt, "Play again") }
-                        IconButton({ opts = true }) { Icon(Icons.Filled.Tune, "Playback options") }
+                        IconButton({ vm.next() }, Modifier.size(40.dp)) { Icon(Icons.Filled.SkipNext, "Next", Modifier.size(28.dp).graphicsLayer { if (isRtl) scaleX = -1f }) }
+                        Surface(onClick = { opts = true }, shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            Row(Modifier.padding(horizontal = 6.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Filled.Tune, "Playback options", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.secondary)
+                                Text("%.1fx".format(vm.speed), Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
                     }
                 }
             }
