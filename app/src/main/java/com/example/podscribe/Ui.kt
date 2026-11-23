@@ -764,33 +764,32 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
     val busy = status != null && !status.startsWith("Failed")
     val localTranscript = transcriptId.startsWith("local-v")
     val displaySegs = remember(segs, localTranscript) {
-        if (!localTranscript) segs else {
-            val joined = ArrayList<Seg>()
-            segs.sortedBy { it.startMs }.forEach { next ->
-                val previous = joined.lastOrNull()
-                if (previous != null && next.startMs - previous.endMs <= 15_000L) {
-                    val left = previous.text.trimEnd()
-                    val right = next.text.trimStart()
-                    val startsWithPunctuation = right.firstOrNull()?.let { it in ".,!?;:%…)]}" } == true
-                    joined[joined.lastIndex] = previous.copy(
-                        endMs = maxOf(previous.endMs, next.endMs),
-                        text = left + (if (startsWithPunctuation) "" else " ") + right,
-                        words = (previous.words + next.words).sortedBy { it.startMs },
-                    )
-                } else joined.add(next)
-            }
-            joined
+        val joined = ArrayList<Seg>()
+        val maxGapMs = if (localTranscript) 15_000L else 3_000L
+        fun joinText(a: String, b: String): String {
+            val left = a.trimEnd(); val right = b.trimStart()
+            val punctuation = right.firstOrNull()?.let { it in ".,!;:%…)]}" } == true
+            return left + (if (punctuation || left.isEmpty()) "" else " ") + right
         }
+        segs.sortedBy { it.startMs }.forEach { next ->
+            val previous = joined.lastOrNull()
+            if (previous != null && next.startMs - previous.endMs in 0..maxGapMs && next.endMs - previous.startMs <= 45_000L) {
+                joined[joined.lastIndex] = previous.copy(endMs = maxOf(previous.endMs, next.endMs),
+                    text = joinText(previous.text, next.text),
+                    tr = if (previous.tr.isBlank()) next.tr else if (next.tr.isBlank()) previous.tr else joinText(previous.tr, next.tr),
+                    words = (previous.words + next.words).sortedBy { it.startMs })
+            } else joined.add(next)
+        }
+        joined
     }
     var mode by remember(transcriptId) { mutableIntStateOf(if (localTranscript) 0 else Repo.tsMode) }
-    val scrollState = rememberScrollState()
+    val transcriptListState = rememberLazyListState()
     var lastFollowedIndex by remember(transcriptId) { mutableIntStateOf(-1) }
     val followedIndex = if (vm.playing) displaySegs.indexOfLast { it.startMs <= vm.pos }.takeIf { it >= 0 && vm.pos <= displaySegs[it].endMs } ?: -1 else -1
     var autoFollow by remember { mutableStateOf(Repo.transcriptAutoFollow) }
     LaunchedEffect(followedIndex, autoFollow) {
         if (autoFollow && followedIndex >= 0 && followedIndex != lastFollowedIndex) {
-            val fraction = followedIndex.toFloat() / displaySegs.size.coerceAtLeast(1)
-            scrollState.animateScrollTo((fraction * scrollState.maxValue).toInt().coerceIn(0, scrollState.maxValue))
+            transcriptListState.animateScrollToItem(followedIndex)
             lastFollowedIndex = followedIndex
         }
     }
@@ -816,8 +815,7 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
     LaunchedEffect(query, mode) { cur = 0 }
     LaunchedEffect(cur, matches, displaySegs) {
         if (matches.isNotEmpty()) {
-            val fraction = matches[cur.coerceIn(0, matches.lastIndex)].first.toFloat() / displaySegs.size.coerceAtLeast(1)
-            scrollState.animateScrollTo((fraction * scrollState.maxValue).toInt().coerceIn(0, scrollState.maxValue))
+            transcriptListState.animateScrollToItem(matches[cur.coerceIn(0, matches.lastIndex)].first)
         }
     }
     fun next() { if (matches.isNotEmpty()) cur = (cur + 1) % matches.size }
@@ -833,7 +831,7 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
                 Icon(Icons.Filled.Search, "Search transcript", tint = if (searchOpen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
             }
             if (displaySegs.isNotEmpty()) IconButton({ confirmClear = true }) { Icon(Icons.Filled.DeleteOutline, "Delete transcript", tint = MaterialTheme.colorScheme.error) }
-            IconButton({ autoFollow = !autoFollow; Repo.transcriptAutoFollow = autoFollow }) {
+            IconButton({ autoFollow = !autoFollow; lastFollowedIndex = -1; Repo.transcriptAutoFollow = autoFollow }) {
                 Icon(Icons.Filled.Sync, if (autoFollow) "Turn off transcript auto-follow" else "Turn on transcript auto-follow",
                     tint = if (autoFollow) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -858,8 +856,8 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
                 }
             } else CompositionLocalProvider(LocalTextToolbar provides toolbar) {
                 SelectionContainer {
-                    Column(Modifier.fillMaxSize().verticalScroll(scrollState).padding(vertical = 16.dp)) {
-                        displaySegs.forEachIndexed { i, s ->
+                    LazyColumn(state = transcriptListState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 16.dp)) {
+                        itemsIndexed(displaySegs, key = { index, item -> "${item.startMs}-$index" }) { i, s ->
                             val cm = matches.getOrNull(cur)
                             val curK = if (cm != null && cm.first == i) cm.second else -1
                             val showOriginal = showOrig(s, mode) || s.tr.isBlank()
@@ -868,10 +866,10 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
                             val currentWord = if (vm.playing) s.words.indexOfFirst { vm.pos >= it.startMs && vm.pos < it.endMs } else -1
                             Column(Modifier.fillMaxWidth().padding(vertical = if (localTranscript) 1.dp else 9.dp)) {
                                 if (showOriginal) Text(if (s.words.isNotEmpty() && query.isBlank()) timedHighlight(s.words, currentWord, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary) else highlight(s.text, query, 0, curK, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary), color = MaterialTheme.colorScheme.onSurface,
-                                    fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 2 else size).sp, lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp)
+                                    fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 2 else size).sp, lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp, textAlign = TextAlign.Justify)
                                 if (showTranslation) Text(highlight(s.tr, query, origCount, curK, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary), Modifier.padding(top = 3.dp),
                                     color = if (mode == 2) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f) else MaterialTheme.colorScheme.onSurface,
-                                    fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 4 else size).sp, lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp)
+                                    fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 4 else size).sp, lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp, textAlign = TextAlign.Justify)
                             }
                         }
                     }

@@ -152,9 +152,13 @@ object Gemini {
             .firstOrNull { runCatching { JSONArray(it); true }.getOrDefault(false) }
             ?: throw IncompleteResponse("Gemini returned incomplete transcript JSON; splitting the audio chunk")
         return try {
-            JSONArray(txt).objs().map {
+            val rows = JSONArray(txt).objs()
+            val parsed = rows.map {
                 Seg(((it.getDouble("start") + offsetSec) * 1000).toLong(), ((it.getDouble("end") + offsetSec) * 1000).toLong(), it.getString("text").trim(), it.optString("translation").trim())
-            }.filter { it.text.isNotBlank() && it.endMs > it.startMs }
+            }
+            if (parsed.isEmpty() || parsed.any { it.text.isBlank() || it.endMs <= it.startMs })
+                throw IncompleteResponse("Gemini returned empty or invalid transcript segments; splitting the audio chunk")
+            parsed
         } catch (e: Exception) {
             throw IncompleteResponse("Gemini returned invalid subtitle segments; splitting the audio chunk", e)
         }
@@ -263,16 +267,18 @@ object Transcriber {
             if (dur <= 0) error("Unknown duration")
             val model = Repo.model; val lang = Repo.lang
             val versionKey = "gemini-transcript-config-${md5(id)}"
-            val configStamp = "v2|$model|$lang|300s"
-            if (Repo.prefs.getString(versionKey, null) != configStamp) {
-                // Keep existing transcript segments when transcription settings change.
-                // New work resumes from the saved progress and only updates its later chunks.
+            val configStamp = "v3|$model|$lang|120s"
+            val configChanged = Repo.prefs.getString(versionKey, null) != configStamp
+            if (configChanged) {
+                // Replay saved audio once after transcript handling changes so old
+                // completed ranges can recover words lost by earlier responses.
+                Repo.setTranscriptionProgress(id, 0)
                 Repo.prefs.edit().putString(versionKey, configStamp).apply()
             }
             val all = ArrayList<Seg>(segs.value[id] ?: emptyList())
-            val chunkSeconds = 300
+            val chunkSeconds = 120
             var from = Repo.transcriptionProgress(id)
-            if (from == 0 && all.isNotEmpty()) {
+            if (!configChanged && from == 0 && all.isNotEmpty()) {
                 val lastEndSec = (all.maxOf { it.endMs } / 1000).toInt()
                 from = ((lastEndSec + chunkSeconds - 1) / chunkSeconds * chunkSeconds).coerceAtMost(dur)
                 Repo.setTranscriptionProgress(id, from)
