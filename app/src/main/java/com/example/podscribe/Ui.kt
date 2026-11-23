@@ -52,6 +52,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import android.provider.Settings
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.input.ImeAction
@@ -750,18 +751,59 @@ private fun timedHighlight(words: List<WordStamp>, active: Int, accent: Color = 
     }
 }
 
+private fun timedTranscriptHighlight(segs: List<Seg>, local: Boolean, active: Int, accent: Color, onAccent: Color): AnnotatedString = buildAnnotatedString {
+    var wordIndex = 0
+    segs.forEachIndexed { segmentIndex, segment ->
+        if (segmentIndex > 0) append(' ')
+        if (local && segment.words.isNotEmpty()) {
+            segment.words.forEachIndexed { index, word ->
+                if (index > 0) append(' ')
+                if (wordIndex == active) withStyle(SpanStyle(background = accent.copy(alpha = 0.85f), color = onAccent)) { append(word.text) }
+                else append(word.text)
+                wordIndex++
+            }
+        } else append(segment.text.trim())
+    }
+}
+
+private data class TranscriptOption(val id: String, val label: String)
+private data class TranscriptSearchHit(val translation: Boolean, val occurrence: Int, val charOffset: Int)
+
 @Composable
 fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
     val allSegs by Transcriber.segs.collectAsState()
     val statuses by Transcriber.status.collectAsState()
-    val preferredId = if (Repo.transcriptionEngine == "local") LocalModels.transcriptId(ep.id) else ep.id
-    val transcriptIds = remember(ep.id) { listOf(ep.id) + LocalModels.catalog.map { LocalModels.transcriptId(it.id, ep.id) } }
-    LaunchedEffect(ep.id) { transcriptIds.forEach(Transcriber::load) }
-    val transcriptId = if (allSegs[preferredId].orEmpty().isNotEmpty()) preferredId
-        else transcriptIds.firstOrNull { allSegs[it].orEmpty().isNotEmpty() } ?: preferredId
+    val cloudProfiles = Repo.geminiTranscriptProfiles(ep.id)
+    val currentCloudId = Gemini.transcriptId(Repo.model, Repo.lang, ep.id)
+    val currentLocalId = LocalModels.transcriptId(ep.id)
+    val transcriptOptions = buildList {
+        cloudProfiles.forEach { add(TranscriptOption(it.transcriptId, "Gemini · ${it.model} · ${it.language}")) }
+        if (allSegs[ep.id].orEmpty().isNotEmpty() && cloudProfiles.none { it.transcriptId == ep.id })
+            add(TranscriptOption(ep.id, "Gemini · previous transcript"))
+        LocalModels.catalog.forEach { model ->
+            val id = LocalModels.transcriptId(model.id, ep.id)
+            if (allSegs[id].orEmpty().isNotEmpty()) add(TranscriptOption(id, "On-device · ${model.title}"))
+        }
+        if (Repo.transcriptionEngine == "local" && none { it.id == currentLocalId }) {
+            val model = LocalModels.catalog.firstOrNull { it.id == LocalModels.selectedId }
+            add(TranscriptOption(currentLocalId, "On-device · ${model?.title ?: LocalModels.selectedId}"))
+        }
+        if (Repo.transcriptionEngine != "local" && none { it.id == currentCloudId })
+            add(TranscriptOption(currentCloudId, "Gemini · ${Repo.model} · ${Repo.lang}"))
+    }
+    val transcriptIds = remember(ep.id, cloudProfiles, currentCloudId) {
+        listOf(ep.id, currentCloudId) + cloudProfiles.map { it.transcriptId } + LocalModels.catalog.map { LocalModels.transcriptId(it.id, ep.id) }
+    }.distinct()
+    LaunchedEffect(transcriptIds) { transcriptIds.forEach(Transcriber::load) }
+    val preferredId = if (Repo.transcriptionEngine == "local") currentLocalId else currentCloudId
+    var selectedTranscriptId by remember(ep.id) { mutableStateOf<String?>(null) }
+    val transcriptId = selectedTranscriptId?.takeIf { id -> transcriptOptions.any { it.id == id } }
+        ?: if (allSegs[preferredId].orEmpty().isNotEmpty()) preferredId
+        else transcriptOptions.firstOrNull { allSegs[it.id].orEmpty().isNotEmpty() }?.id ?: preferredId
     val segs = allSegs[transcriptId] ?: emptyList()
     val status = statuses[ep.id]
-    val busy = status != null && !status.startsWith("Failed")
+    val paused = status == "Paused"
+    val busy = status != null && !paused && !status.startsWith("Failed")
     val localTranscript = transcriptId.startsWith("local-v")
     val displaySegs = remember(segs, localTranscript) {
         val joined = ArrayList<Seg>()
@@ -783,43 +825,116 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
         joined
     }
     var mode by remember(transcriptId) { mutableIntStateOf(if (localTranscript) 0 else Repo.tsMode) }
-    val transcriptListState = rememberLazyListState()
-    var lastFollowedIndex by remember(transcriptId) { mutableIntStateOf(-1) }
-    val followedIndex = if (vm.playing) displaySegs.indexOfLast { it.startMs <= vm.pos }.takeIf { it >= 0 && vm.pos <= displaySegs[it].endMs } ?: -1 else -1
-    var autoFollow by remember { mutableStateOf(Repo.transcriptAutoFollow) }
-    LaunchedEffect(followedIndex, autoFollow) {
-        if (autoFollow && followedIndex >= 0 && followedIndex != lastFollowedIndex) {
-            transcriptListState.animateScrollToItem(followedIndex)
-            lastFollowedIndex = followedIndex
+    val originalParts = remember(displaySegs, localTranscript) {
+        displaySegs.map { seg -> if (localTranscript && seg.words.isNotEmpty()) seg.words.joinToString(" ") { it.text } else seg.text.trim() }
+    }
+    val translationParts = remember(displaySegs, originalParts) {
+        displaySegs.mapIndexed { index, seg -> seg.tr.trim().ifBlank { originalParts[index] } }
+    }
+    val originalText = remember(originalParts) { originalParts.joinToString(" ") }
+    val translationText = remember(translationParts) { translationParts.joinToString(" ") }
+    val showOriginalText = mode != 1
+    val showTranslationText = mode != 0
+    val wordStamps = remember(displaySegs) { displaySegs.flatMap { it.words } }
+    val wordOffsets = remember(displaySegs, localTranscript) {
+        buildList {
+            var offset = 0
+            displaySegs.forEachIndexed { index, seg ->
+                if (index > 0) offset++
+                if (localTranscript && seg.words.isNotEmpty()) {
+                    seg.words.forEachIndexed { wordIndex, word ->
+                        if (wordIndex > 0) offset++
+                        add(offset)
+                        offset += word.text.length
+                    }
+                } else offset += seg.text.trim().length
+            }
         }
     }
-    val size = Repo.tsSize
-    val view = LocalView.current
-    val toolbar = remember(view) { ShareToolbar(view) }
-    DisposableEffect(toolbar) { onDispose { toolbar.hide() } }
-
+    val originalSegmentOffsets = remember(originalParts) {
+        buildList {
+            var offset = 0
+            originalParts.forEachIndexed { index, part ->
+                if (index > 0) offset++
+                add(offset)
+                offset += part.length
+            }
+        }
+    }
+    val translationSegmentOffsets = remember(translationParts) {
+        buildList {
+            var offset = 0
+            translationParts.forEachIndexed { index, part ->
+                if (index > 0) offset++
+                add(offset)
+                offset += part.length
+            }
+        }
+    }
+    val transcriptScroll = rememberScrollState()
+    var originalLayout by remember(transcriptId) { mutableStateOf<TextLayoutResult?>(null) }
+    var translationLayout by remember(transcriptId) { mutableStateOf<TextLayoutResult?>(null) }
+    var autoFollow by remember { mutableStateOf(Repo.transcriptAutoFollow) }
+    val followedIndex = if (vm.playing) displaySegs.indexOfLast { it.startMs <= vm.pos }.takeIf { it >= 0 && vm.pos <= displaySegs[it].endMs } ?: -1 else -1
+    val activeWordIndex = if (vm.playing) wordStamps.indexOfFirst { vm.pos >= it.startMs && vm.pos < it.endMs } else -1
     var searchOpen by remember { mutableStateOf(false) }
+    var transcriptMenuOpen by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var cur by remember { mutableIntStateOf(0) }
     var confirmClear by remember { mutableStateOf(false) }
-    val matches = remember(segs, query, mode) {
-        val out = ArrayList<Pair<Int, Int>>()
-        if (query.isNotEmpty()) displaySegs.forEachIndexed { i, s ->
-            var k = 0
-            if (showOrig(s, mode) || s.tr.isBlank()) k += occurrences(s.text, query)
-            if (showTr(s, mode) && s.tr.isNotBlank()) k += occurrences(s.tr, query)
-            repeat(k) { out.add(i to it) }
+    fun offsets(text: String): List<Int> {
+        if (query.isEmpty()) return emptyList()
+        val found = ArrayList<Int>()
+        var start = 0
+        while (start < text.length) {
+            val index = text.indexOf(query, start, ignoreCase = true)
+            if (index < 0) break
+            found.add(index)
+            start = index + query.length
         }
-        out
+        return found
+    }
+    val originalHitOffsets = remember(originalText, query, showOriginalText) { if (showOriginalText) offsets(originalText) else emptyList() }
+    val translationHitOffsets = remember(translationText, query, showTranslationText) { if (showTranslationText) offsets(translationText) else emptyList() }
+    val matches = remember(originalHitOffsets, translationHitOffsets) {
+        originalHitOffsets.mapIndexed { index, charOffset -> TranscriptSearchHit(false, index, charOffset) } +
+            translationHitOffsets.mapIndexed { index, charOffset -> TranscriptSearchHit(true, originalHitOffsets.size + index, charOffset) }
     }
     LaunchedEffect(query, mode) { cur = 0 }
-    LaunchedEffect(cur, matches, displaySegs) {
-        if (matches.isNotEmpty()) {
-            transcriptListState.animateScrollToItem(matches[cur.coerceIn(0, matches.lastIndex)].first)
+    LaunchedEffect(cur, matches, originalLayout, translationLayout, transcriptScroll.maxValue) {
+        val hit = matches.getOrNull(cur.coerceIn(0, (matches.size - 1).coerceAtLeast(0)))
+        val layout = if (hit?.translation == true) translationLayout else originalLayout
+        if (hit != null && layout != null) {
+            val textLength = if (hit.translation) translationText.length else originalText.length
+            if (textLength > 0) {
+                val top = layout.getBoundingBox(hit.charOffset.coerceIn(0, textLength - 1)).top
+                transcriptScroll.animateScrollTo((top - 100f).toInt().coerceIn(0, transcriptScroll.maxValue))
+            }
+        }
+    }
+    LaunchedEffect(followedIndex, activeWordIndex, autoFollow, originalLayout, translationLayout, query, mode, transcriptScroll.maxValue) {
+        if (autoFollow && query.isBlank() && followedIndex >= 0) {
+            val useTranslation = mode == 1
+            val layout = if (useTranslation) translationLayout else originalLayout
+            val textLength = if (useTranslation) translationText.length else originalText.length
+            val charOffset = if (localTranscript && activeWordIndex in wordOffsets.indices) wordOffsets[activeWordIndex]
+                else if (useTranslation) translationSegmentOffsets.getOrNull(followedIndex) ?: 0
+                else originalSegmentOffsets.getOrNull(followedIndex) ?: 0
+            if (layout != null && textLength > 0) {
+                val top = layout.getBoundingBox(charOffset.coerceIn(0, textLength - 1)).top
+                transcriptScroll.animateScrollTo((top - 100f).toInt().coerceIn(0, transcriptScroll.maxValue))
+            }
         }
     }
     fun next() { if (matches.isNotEmpty()) cur = (cur + 1) % matches.size }
     fun prev() { if (matches.isNotEmpty()) cur = (cur - 1 + matches.size) % matches.size }
+    val currentHit = matches.getOrNull(cur.coerceIn(0, (matches.size - 1).coerceAtLeast(0)))
+    val currentOriginalHit = currentHit?.takeIf { !it.translation }?.occurrence ?: -1
+    val currentTranslationHit = currentHit?.takeIf { it.translation }?.occurrence ?: -1
+    val size = Repo.tsSize
+    val view = LocalView.current
+    val toolbar = remember(view) { ShareToolbar(view) }
+    DisposableEffect(toolbar) { onDispose { toolbar.hide() } }
 
     Column(modifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -831,12 +946,33 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
                 Icon(Icons.Filled.Search, "Search transcript", tint = if (searchOpen) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
             }
             if (displaySegs.isNotEmpty()) IconButton({ confirmClear = true }) { Icon(Icons.Filled.DeleteOutline, "Delete transcript", tint = MaterialTheme.colorScheme.error) }
-            IconButton({ autoFollow = !autoFollow; lastFollowedIndex = -1; Repo.transcriptAutoFollow = autoFollow }) {
+            IconButton({ autoFollow = !autoFollow; Repo.transcriptAutoFollow = autoFollow }) {
                 Icon(Icons.Filled.Sync, if (autoFollow) "Turn off transcript auto-follow" else "Turn on transcript auto-follow",
                     tint = if (autoFollow) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (busy) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            if (busy) IconButton({ Transcriber.requestPause(ep.id) }) { Icon(Icons.Filled.Pause, "Pause transcription", tint = MaterialTheme.colorScheme.primary) }
+            else if (paused) IconButton({ vm.transcribe(ep) }) { Icon(Icons.Filled.PlayArrow, "Continue transcription", tint = MaterialTheme.colorScheme.primary) }
             else IconButton({ vm.transcribe(ep) }) { Icon(Icons.Filled.Subtitles, "Transcribe", tint = MaterialTheme.colorScheme.primary) }
+        }
+        if (transcriptOptions.isNotEmpty()) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Transcript version", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.weight(1f))
+            val selectedOption = transcriptOptions.firstOrNull { it.id == transcriptId }
+            Box {
+                TextButton(onClick = { if (transcriptOptions.size > 1) transcriptMenuOpen = true }, enabled = transcriptOptions.size > 1) {
+                    Text(selectedOption?.label ?: "Transcript", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (transcriptOptions.size > 1) Icon(Icons.Filled.ArrowDropDown, null)
+                }
+                DropdownMenu(expanded = transcriptMenuOpen, onDismissRequest = { transcriptMenuOpen = false }) {
+                    transcriptOptions.forEach { option ->
+                        DropdownMenuItem(text = { Text(option.label) }, onClick = {
+                            selectedTranscriptId = option.id
+                            Transcriber.load(option.id)
+                            transcriptMenuOpen = false
+                        })
+                    }
+                }
+            }
         }
         if (searchOpen) Row(Modifier.fillMaxWidth().padding(bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(query, { query = it }, Modifier.weight(1f), singleLine = true, placeholder = { Text("Search transcript") },
@@ -847,7 +983,7 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
             IconButton({ prev() }) { Icon(Icons.Filled.KeyboardArrowUp, "Previous match") }
             IconButton({ next() }) { Icon(Icons.Filled.KeyboardArrowDown, "Next match") }
         }
-        if (status != null) Text(status, style = MaterialTheme.typography.bodySmall, color = if (busy) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+        if (status != null) Text(status, style = MaterialTheme.typography.bodySmall, color = if (busy || paused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
         Box(Modifier.weight(1f).fillMaxWidth()) {
             if (displaySegs.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
@@ -856,21 +992,23 @@ fun TranscriptPanel(vm: AppVM, ep: Episode, modifier: Modifier) {
                 }
             } else CompositionLocalProvider(LocalTextToolbar provides toolbar) {
                 SelectionContainer {
-                    LazyColumn(state = transcriptListState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 16.dp)) {
-                        itemsIndexed(displaySegs, key = { index, item -> "${item.startMs}-$index" }) { i, s ->
-                            val cm = matches.getOrNull(cur)
-                            val curK = if (cm != null && cm.first == i) cm.second else -1
-                            val showOriginal = showOrig(s, mode) || s.tr.isBlank()
-                            val showTranslation = showTr(s, mode) && s.tr.isNotBlank()
-                            val origCount = if (showOriginal) occurrences(s.text, query) else 0
-                            val currentWord = if (vm.playing) s.words.indexOfFirst { vm.pos >= it.startMs && vm.pos < it.endMs } else -1
-                            Column(Modifier.fillMaxWidth().padding(vertical = if (localTranscript) 1.dp else 9.dp)) {
-                                if (showOriginal) Text(if (s.words.isNotEmpty() && query.isBlank()) timedHighlight(s.words, currentWord, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary) else highlight(s.text, query, 0, curK, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary), color = MaterialTheme.colorScheme.onSurface,
-                                    fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 2 else size).sp, lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp, textAlign = TextAlign.Justify)
-                                if (showTranslation) Text(highlight(s.tr, query, origCount, curK, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary), Modifier.padding(top = 3.dp),
-                                    color = if (mode == 2) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f) else MaterialTheme.colorScheme.onSurface,
-                                    fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 4 else size).sp, lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp, textAlign = TextAlign.Justify)
-                            }
+                    Column(Modifier.fillMaxSize().verticalScroll(transcriptScroll).padding(vertical = 16.dp, horizontal = 8.dp)) {
+                        if (showOriginalText) {
+                            val annotated = if (localTranscript && query.isBlank())
+                                timedTranscriptHighlight(displaySegs, localTranscript, activeWordIndex, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary)
+                            else highlight(originalText, query, 0, currentOriginalHit, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary)
+                            Text(annotated, color = MaterialTheme.colorScheme.onSurface,
+                                fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 2 else size).sp,
+                                lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp, textAlign = TextAlign.Justify,
+                                onTextLayout = { originalLayout = it })
+                        }
+                        if (showTranslationText) {
+                            Text(highlight(translationText, query, originalHitOffsets.size, currentTranslationHit, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.onPrimary),
+                                Modifier.fillMaxWidth().padding(top = if (showOriginalText) 8.dp else 0.dp),
+                                color = if (mode == 2) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.68f) else MaterialTheme.colorScheme.onSurface,
+                                fontFamily = FontFamily.Serif, fontSize = (if (mode == 2) size - 4 else size).sp,
+                                lineHeight = (size * 1.5f).sp, letterSpacing = 0.1.sp, textAlign = TextAlign.Justify,
+                                onTextLayout = { translationLayout = it })
                         }
                     }
                 }

@@ -10,5 +10,6 @@ data class Episode(
 
 data class WordStamp(val text: String, val startMs: Long, val endMs: Long)
 data class Seg(val startMs: Long, val endMs: Long, val text: String, val tr: String, val words: List<WordStamp> = emptyList())
+data class CloudTranscriptProfile(val transcriptId: String, val model: String, val language: String)
 
 open class ApiRequestException(val statusCode: Int, message: String) : Exception(message)

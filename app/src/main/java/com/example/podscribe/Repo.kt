@@ -188,8 +188,23 @@ object Repo {
     fun markSeen(id: String) = updateEpisode(id) { it.copy(seen = true) }
     fun clearTranscript(id: String) {
         deleteTranscript(id)
+        geminiTranscriptProfiles(id).forEach { deleteTranscript(it.transcriptId) }
+        prefs.edit().remove(geminiProfilesKey(id)).apply()
         LocalModels.catalog.forEach { deleteTranscript(LocalModels.transcriptId(it.id, id)) }
         Transcriber.segs.value = Transcriber.segs.value.filterKeys { !it.endsWith(":$id") && it != id }
+    }
+
+    private fun geminiProfilesKey(episodeId: String) = "gemini-transcript-profiles-${md5(episodeId)}"
+    fun geminiTranscriptProfiles(episodeId: String): List<CloudTranscriptProfile> = runCatching {
+        val json = JSONArray(prefs.getString(geminiProfilesKey(episodeId), "[]") ?: "[]")
+        json.objs().map { CloudTranscriptProfile(it.getString("id"), it.getString("model"), it.getString("language")) }
+    }.getOrDefault(emptyList())
+
+    fun recordGeminiTranscriptProfile(episodeId: String, profile: CloudTranscriptProfile) {
+        val profiles = geminiTranscriptProfiles(episodeId).filterNot { it.transcriptId == profile.transcriptId } + profile
+        prefs.edit().putString(geminiProfilesKey(episodeId), JSONArray(profiles.map {
+            JSONObject().put("id", it.transcriptId).put("model", it.model).put("language", it.language)
+        }).toString()).apply()
     }
 
     fun removePodcast(id: String) {
@@ -200,6 +215,8 @@ object Repo {
         removed.forEach { e ->
             runCatching { e.localPath?.let(::deleteAudio) }
             runCatching { deleteTranscript(e.id) }
+            geminiTranscriptProfiles(e.id).forEach { runCatching { deleteTranscript(it.transcriptId) } }
+            prefs.edit().remove(geminiProfilesKey(e.id)).apply()
             LocalModels.catalog.forEach { local -> runCatching { deleteTranscript(LocalModels.transcriptId(local.id, e.id)) } }
         }
     }

@@ -121,6 +121,7 @@ object LocalModels {
             if (start >= duration) start = (duration - 60).coerceAtLeast(0)
             start = start.coerceAtMost(duration)
             while (start < duration) {
+                if (Transcriber.pauseAtSectionBoundary(episode.id)) return@withContext
                 val end = minOf(start + 60, duration)
                 val recheckingTail = Repo.transcriptionProgress(transcriptId) >= duration && start == (duration - 60).coerceAtLeast(0)
                 Transcriber.setExternalStatus(episode.id, if (recheckingTail) "Checking the final minute with ${model.title}…" else "Local ${model.title}: ${start * 100 / duration}%…")
